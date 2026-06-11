@@ -24,6 +24,10 @@ from ...utils import auto_docstring
 @strict
 class Qwen3Config(PreTrainedConfig):
     r"""
+    rope_waveform (`str`, *optional*, defaults to `"sinusoid"`):
+        Waveform used to generate Qwen3 RoPE cos/sin values. `"sinusoid"` keeps standard RoPE. `"triangular"`,
+        `"square"`, and `"sawtooth"` use wave-RoPE with `sin(theta)=f(theta)` and `cos(theta)=f(pi/2-theta)`.
+
     ```python
     >>> from transformers import Qwen3Model, Qwen3Config
 
@@ -73,6 +77,7 @@ class Qwen3Config(PreTrainedConfig):
     use_cache: bool = True
     tie_word_embeddings: bool = False
     rope_parameters: RopeParameters | dict | None = None
+    rope_waveform: str = "sinusoid"
     attention_bias: bool = False
     use_sliding_window: bool = False
     sliding_window: int | None = 4096
@@ -84,6 +89,11 @@ class Qwen3Config(PreTrainedConfig):
     eos_token_id: int | list[int] | None = None
 
     def __post_init__(self, **kwargs):
+        if self.rope_waveform not in {"sinusoid", "triangular", "square", "sawtooth"}:
+            raise ValueError(
+                f"`rope_waveform` must be one of 'sinusoid', 'triangular', 'square', or 'sawtooth', "
+                f"got {self.rope_waveform!r}."
+            )
         self.sliding_window = self.sliding_window if self.use_sliding_window else None
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads

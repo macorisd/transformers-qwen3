@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Callable
 from typing import Optional
 
@@ -44,6 +45,25 @@ from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import maybe_autocast, merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from .configuration_qwen3 import Qwen3Config
+
+_QWEN3_ROPE_WAVEFORMS = {"sinusoid", "triangular", "square", "sawtooth"}
+
+
+def _qwen3_rope_wave(x: torch.Tensor, waveform: str) -> torch.Tensor:
+    if waveform == "sinusoid":
+        return torch.sin(x)
+    if waveform == "triangular":
+        return (2.0 / math.pi) * torch.asin(torch.sin(x))
+
+    x_mod = torch.remainder(x, 2.0 * math.pi)
+    if waveform == "square":
+        return torch.where(x_mod < math.pi, -torch.ones_like(x_mod), torch.ones_like(x_mod))
+    if waveform == "sawtooth":
+        return torch.where(x_mod <= math.pi, x_mod / math.pi, (x_mod - 2.0 * math.pi) / math.pi)
+
+    raise ValueError(
+        f"Unsupported Qwen3 RoPE waveform {waveform!r}. Supported values: {sorted(_QWEN3_ROPE_WAVEFORMS)}"
+    )
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -142,8 +162,21 @@ class Qwen3RotaryEmbedding(nn.Module):
         with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
             freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
             emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos() * self.attention_scaling
-            sin = emb.sin() * self.attention_scaling
+            waveform = getattr(self.config, "rope_waveform", "sinusoid")
+            if waveform not in _QWEN3_ROPE_WAVEFORMS:
+                raise ValueError(
+                    f"Unsupported Qwen3 RoPE waveform {waveform!r}. "
+                    f"Supported values: {sorted(_QWEN3_ROPE_WAVEFORMS)}"
+                )
+            if waveform == "sinusoid":
+                cos = emb.cos()
+                sin = emb.sin()
+            else:
+                # Wave-RoPE: sin(theta)=f(theta), cos(theta)=f(pi/2-theta).
+                sin = _qwen3_rope_wave(emb, waveform)
+                cos = _qwen3_rope_wave(math.pi / 2.0 - emb, waveform)
+            cos = cos * self.attention_scaling
+            sin = sin * self.attention_scaling
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
