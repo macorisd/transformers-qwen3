@@ -183,3 +183,13 @@ test-results/
 # AI agent local setup artifacts
 /.agents/skills
 /.claude/skills
+
+# Local Qwen3 experiment artifacts
+/outputs/
+/graphs/
+/graphs_k_fold/
+/checkpoints/
+/.hf_cache/
+/.venv/
+*.out
+*.err
