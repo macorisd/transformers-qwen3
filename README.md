@@ -1,3 +1,11 @@
+# Qwen3 architecture - Master's Thesis by Macorís Decena Giménez
+
+This fork was developed as part of my Master's Thesis, which studies the replacement of the original sinusoidal positional encoding used in Transformer-based architectures with alternative periodic functions. This repository is a fork of the complete Hugging Face Transformers codebase, and the thesis-specific modifications focus on the Qwen3 implementation in order to evaluate the effect of alternative waveform choices in a RoPE-based architecture.
+
+The trained model weights are available in Google Drive: [https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing](https://drive.google.com/drive/folders/1IxeLRsapGrlCpydSH6j553VWeqcCe1LQ?usp=sharing)
+
+---
+
 <!---
 Copyright 2020 The HuggingFace Team. All rights reserved.
 
