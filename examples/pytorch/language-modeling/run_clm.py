@@ -22,7 +22,6 @@
 #     "datasets >= 2.14.0",
 #     "sentencepiece != 0.1.92",
 #     "protobuf",
-#     "evaluate",
 #     "scikit-learn",
 # ]
 # ///
@@ -38,14 +37,16 @@ https://huggingface.co/models?filter=text-generation
 import logging
 import math
 import os
+import re
 import sys
+import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from itertools import chain
 
 import datasets
-import evaluate
 import torch
-from datasets import IterableDataset, IterableDatasetDict, load_dataset
+from datasets import IterableDataset, IterableDatasetDict, load_dataset, load_from_disk
 
 import transformers
 from transformers import (
@@ -152,6 +153,16 @@ class ModelArguments:
             "choices": ["auto", "bfloat16", "float16", "float32"],
         },
     )
+    rope_waveform: str = field(
+        default="sinusoid",
+        metadata={
+            "help": (
+                "Qwen3 RoPE waveform. 'sinusoid' keeps standard RoPE; the other values use wave-RoPE with "
+                "sin(theta)=f(theta) and cos(theta)=f(pi/2-theta)."
+            ),
+            "choices": ["sinusoid", "triangular", "square", "sawtooth"],
+        },
+    )
 
     def __post_init__(self):
         if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
@@ -171,6 +182,10 @@ class DataTrainingArguments:
     )
     dataset_config_name: str | None = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
+    )
+    dataset_dir: str | None = field(
+        default=None,
+        metadata={"help": "Path to a Dataset or DatasetDict saved with datasets.save_to_disk for offline use."},
     )
     train_file: str | None = field(default=None, metadata={"help": "The input training data file (a text file)."})
     validation_file: str | None = field(
@@ -227,8 +242,13 @@ class DataTrainingArguments:
         if self.streaming:
             require_version("datasets>=2.0.0", "The streaming feature requires `datasets>=2.0.0`")
 
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
+        if (
+            self.dataset_name is None
+            and self.dataset_dir is None
+            and self.train_file is None
+            and self.validation_file is None
+        ):
+            raise ValueError("Need either a dataset name, dataset directory, or a training/validation file.")
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
@@ -277,6 +297,81 @@ def split_streaming_dataset(
     return IterableDatasetDict({"train": train_stream, "validation": validation_stream})
 
 
+def _slugify_run_part(value: str) -> str:
+    value = os.path.basename(value.strip())
+    stem, ext = os.path.splitext(value)
+    if ext:
+        value = stem
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return value or "unknown"
+
+
+def _dataset_run_slug(data_args: DataTrainingArguments) -> str:
+    if data_args.dataset_name:
+        parts = [data_args.dataset_name]
+        if data_args.dataset_config_name:
+            parts.append(data_args.dataset_config_name)
+        return _slugify_run_part("-".join(parts))
+    if data_args.dataset_dir:
+        return _slugify_run_part(data_args.dataset_dir)
+    if data_args.train_file:
+        return _slugify_run_part(data_args.train_file)
+    if data_args.validation_file:
+        return _slugify_run_part(data_args.validation_file)
+    return "unspecified-dataset"
+
+
+def _arg_present(*names: str) -> bool:
+    return any(arg in names or any(arg.startswith(f"{name}=") for name in names) for arg in sys.argv[1:])
+
+
+def _set_structured_qwen3_output_dir(model_args, data_args, training_args) -> None:
+    exact_output_dir = os.environ.get("QWEN3_OUTPUT_DIR")
+    if exact_output_dir:
+        training_args.output_dir = exact_output_dir
+        return
+
+    base_output_dir = os.environ.get("QWEN3_OUTPUT_BASE_DIR")
+    if base_output_dir is None:
+        if training_args.output_dir and (
+            training_args.output_dir != "trainer_output" or _arg_present("--output_dir", "--output-dir")
+        ):
+            base_output_dir = training_args.output_dir
+        else:
+            base_output_dir = "outputs"
+
+    timestamp = os.environ.get("QWEN3_OUTPUT_TIMESTAMP") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dataset_slug = _dataset_run_slug(data_args)
+    training_args.output_dir = os.path.join(
+        base_output_dir, f"qwen3_{model_args.rope_waveform}", f"{timestamp}_{dataset_slug}"
+    )
+
+
+def _apply_qwen3_kfold_indices(raw_datasets):
+    indices_file = os.environ.get("QWEN3_KFOLD_INDICES_FILE")
+    if not indices_file:
+        return raw_datasets
+    if isinstance(raw_datasets, (IterableDataset, IterableDatasetDict)):
+        raise ValueError("Qwen3 k-fold training requires a non-streaming dataset.")
+
+    with open(indices_file, encoding="utf-8") as handle:
+        fold_spec = json.load(handle)
+
+    if isinstance(raw_datasets, datasets.DatasetDict):
+        if "train" not in raw_datasets:
+            raise ValueError("Qwen3 k-fold training requires a train split in the base dataset.")
+        base_train = raw_datasets["train"]
+    else:
+        base_train = raw_datasets
+
+    return datasets.DatasetDict(
+        {
+            "train": base_train.select(fold_spec["train_indices"]),
+            "validation": base_train.select(fold_spec["validation_indices"]),
+        }
+    )
+
+
 def main():
     # See all possible arguments in src/transformers/training_args.py
     # or by passing the --help flag to this script.
@@ -289,6 +384,8 @@ def main():
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+
+    _set_structured_qwen3_output_dir(model_args, data_args, training_args)
 
     # Setup logging
     logging.basicConfig(
@@ -327,7 +424,9 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.dataset_name is not None:
+    if data_args.dataset_dir is not None:
+        raw_datasets = load_from_disk(data_args.dataset_dir)
+    elif data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(
             data_args.dataset_name,
@@ -421,6 +520,17 @@ def main():
                     **dataset_args,
                 )
 
+    raw_datasets = _apply_qwen3_kfold_indices(raw_datasets)
+
+    requested_splits = {}
+    if training_args.do_train and "train" in raw_datasets:
+        requested_splits["train"] = raw_datasets["train"]
+    if training_args.do_eval and "validation" in raw_datasets:
+        requested_splits["validation"] = raw_datasets["validation"]
+    if requested_splits and set(requested_splits) != set(raw_datasets.keys()):
+        dataset_dict_cls = IterableDatasetDict if isinstance(raw_datasets, IterableDatasetDict) else datasets.DatasetDict
+        raw_datasets = dataset_dict_cls(requested_splits)
+
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
 
@@ -447,6 +557,16 @@ def main():
             logger.info(f"Overriding config: {model_args.config_overrides}")
             config.update_from_string(model_args.config_overrides)
             logger.info(f"New config: {config}")
+
+    if getattr(config, "model_type", None) == "qwen3":
+        config.rope_waveform = model_args.rope_waveform
+        logger.info(f"Using Qwen3 RoPE waveform: {config.rope_waveform}")
+    elif model_args.rope_waveform != "sinusoid":
+        logger.warning(
+            f"--rope_waveform={model_args.rope_waveform} was requested, but model_type={config.model_type!r} "
+            "is not qwen3; the option will be stored on the config but may have no effect."
+        )
+        config.rope_waveform = model_args.rope_waveform
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -618,15 +738,16 @@ def main():
                 logits = logits[0]
             return logits.argmax(dim=-1)
 
-        metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
-
         def compute_metrics(eval_preds):
             preds, labels = eval_preds
             # preds have the same shape as the labels, after the argmax(-1) has been calculated
             # by preprocess_logits_for_metrics but we need to shift the labels
             labels = labels[:, 1:].reshape(-1)
             preds = preds[:, :-1].reshape(-1)
-            return metric.compute(predictions=preds, references=labels)
+            mask = labels != -100
+            if not mask.any():
+                return {"accuracy": 0.0}
+            return {"accuracy": float((preds[mask] == labels[mask]).mean())}
 
     # Initialize our Trainer
     trainer = Trainer(
